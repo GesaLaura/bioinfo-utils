@@ -183,7 +183,7 @@ def main(base_dir=".", REGIONS_OF_INTEREST=None, output_path="af3_metrics_summar
 
 if __name__ == "__main__":
     # Define your base directory here (directory containing AF3 model folders)
-    BASE_DIR = "/home/gfreimann/Seafile/Freimann_PhD/1_Projects/SolubleAf1503/alphafold3models"
+    BASE_DIR = "/your/path/to/af3_models"
     
     # Define your regions of interest here
     REGIONS_OF_INTEREST = [
