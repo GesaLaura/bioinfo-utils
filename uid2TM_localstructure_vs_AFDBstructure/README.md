@@ -45,7 +45,7 @@ Open the script and edit the configuration section:
 2. **Run the script:**
 Once configured, run the script from your terminal:
 ```bash
-python3 run_structure_comparison.py
+python3 uid2TM_localstructure_vs_AFDBstructure.py
 
 ```
 
