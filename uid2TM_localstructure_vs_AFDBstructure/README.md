@@ -1,10 +1,10 @@
-#Automated Structural Alignment via TM-align
+# Automated Structural Alignment via TM-align
 
 This Python script automates the one-to-many structural comparison of a specific local reference PDB file against a list of UniProt entries. It dynamically fetches predicted protein structures from the **AlphaFold Protein Structure Database**, calculates the **Radius of Gyration (Rg)** for both the reference and query structures, executes the **TM-align** algorithm, and parses the output for **RMSD**, **TM-Score**, and **Aligned Length**.
 
 The script generates a consolidated CSV file for statistical analysis and saves the raw PDB files and TM-align output logs in a dedicated working directory.
 
-##Requirements* Python 3
+## Requirements* Python 3
 * [Biopython](https://biopython.org/) (for PDB parsing and Rg calculation)
 * [Pandas](https://pandas.pydata.org/)
 * [Requests](https://pypi.org/project/requests/)
@@ -29,7 +29,7 @@ Save and exit the editor, then reload the shell configuration:
 Confirm the installation:
 > TMalign -h
 
-##UsageThe script is configured by modifying the variables at the top of the file to match your specific experiment.
+## UsageThe script is configured by modifying the variables at the top of the file to match your specific experiment.
 
 1. **Configure script variables:**
 Open the script and edit the configuration section:
@@ -47,9 +47,7 @@ python3 run_structure_comparison.py
 
 ```
 
-
-
-##OutputThe script will generate a CSV file (defined in `OUTPUT_CSV_NAME`) containing the following columns for every processed ID:
+## OutputThe script will generate a CSV file (defined in `OUTPUT_CSV_NAME`) containing the following columns for every processed ID:
 
 * **Query_ID**: The UniProt ID of the fetched structure.
 * **Rg_Query**: Radius of Gyration of the fetched structure.
