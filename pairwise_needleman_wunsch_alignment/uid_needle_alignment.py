@@ -11,19 +11,7 @@ TARGET_SEQUENCE = "MLNFYSLLPFSALLTNLVFGIFILYIDPKSRLNRLYSLFTLSFAFWALGDFMVFMAYDQGS
 
 # 2. List of UniProt IDs to fetch
 uniprot_ids = [
-    "O29843",  
-    "O28170",  
-    "O28106",  
-    "O28155",  
-    "O28178",  
-    "O28298",  
-    "O28711",  
-    "O28812",  
-    "O28838",  
-    "O28879",  
-    "O29023", 
-    "O29467",  
-    "O29726"
+    "O28693"
 ]
 
 # 3. Output CSV for the statistics
