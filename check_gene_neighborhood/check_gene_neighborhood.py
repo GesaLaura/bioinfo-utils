@@ -173,76 +173,78 @@ def chunk_list(lst, n):
 
 import re
 
-def fetch_locus_tags(unmapped_ids):
+def fetch_locus_tags(unmapped_ids, chunk_size=50):
     """
     Fallback: Fetch Ordered Locus Names or Gene Names from UniProt.
-    Supports both UniProt Accessions and Entry Names (IDs).
+    Processes in chunks to avoid '400 Bad Request' errors caused by long URLs.
     """
     locus_mappings = {}
     if not unmapped_ids:
         return locus_mappings
 
-    print(f"  Attempting metadata lookup for {len(unmapped_ids)} unmapped IDs...")
+    unmapped_list = list(unmapped_ids)
+    total_chunks = (len(unmapped_list) + chunk_size - 1) // chunk_size
+
+    print(f"  Attempting metadata lookup for {len(unmapped_list)} IDs in {total_chunks} chunks...")
     
-    # 1. Build query: Check if ID looks like an Accession or an Entry Name (ID)
-    # Accessions: [OPQ][0-9][A-Z0-9]{3}[0-9] or [A-N,R-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}
-    # Entry Names: usually Word_Word (e.g., RECA_THETH)
-    query_parts = []
-    for uid in unmapped_ids:
-        if re.match(r"^[A-Z][0-9][A-Z0-9]{3}[0-9](-[0-9]+)?$", uid) or re.match(r"^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$", uid):
-            query_parts.append(f"accession:{uid}")
-        else:
-            query_parts.append(f"id:{uid}")
+    for i, chunk in enumerate(chunk_list(unmapped_list, chunk_size), 1):
+        query_parts = []
+        for uid in chunk:
+            # Check if ID looks like an Accession or an Entry Name (ID)
+            if re.match(r"^[A-Z][0-9][A-Z0-9]{3}[0-9](-[0-9]+)?$", uid) or \
+               re.match(r"^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$", uid):
+                query_parts.append(f"accession:{uid}")
+            else:
+                query_parts.append(f"id:{uid}")
 
-    query = " OR ".join(query_parts)
-    url = f"https://rest.uniprot.org/uniprotkb/search?query={query}&fields=id,accession,gene_oln,gene_primary&format=json"
+        query = " OR ".join(query_parts)
+        url = "https://rest.uniprot.org/uniprotkb/search"
+        params = {
+            "query": query,
+            "fields": "id,accession,gene_oln,gene_primary",
+            "format": "json"
+        }
 
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
 
-        for entry in data.get("results", []):
-            acc = entry.get("primaryAccession")
-            entry_name = entry.get("uniProtkbId")
-            
-            # Determine which input ID matches this result
-            # (Mapping back to the original input used in the query)
-            match_key = None
-            if acc in unmapped_ids:
-                match_key = acc
-            elif entry_name in unmapped_ids:
-                match_key = entry_name
-
-            if not match_key:
-                continue
-
-            genes = entry.get("genes", [])
-            target_value = None
-
-            for gene in genes:
-                # Priority 1: Ordered Locus Name (OLN)
-                olns = gene.get("orderedLocusNames", [])
-                if olns:
-                    target_value = olns[0].get("value")
-                    break
+            for entry in data.get("results", []):
+                acc = entry.get("primaryAccession")
+                entry_name = entry.get("uniProtkbId")
                 
-                # Priority 2: Primary Gene Name
-                primary = gene.get("geneName")
-                if primary:
-                    target_value = primary.get("value")
-                    break
+                # Identify which ID from the current chunk matched this result
+                match_key = acc if acc in chunk else entry_name
 
-            if target_value:
-                locus_mappings[match_key] = target_value
+                if not match_key:
+                    continue
 
-    except Exception as e:
-        print(f"    Metadata lookup failed: {e}")
+                genes = entry.get("genes", [])
+                target_value = None
+
+                for gene in genes:
+                    # Priority 1: Ordered Locus Name (OLN)
+                    olns = gene.get("orderedLocusNames", [])
+                    if olns:
+                        target_value = olns[0].get("value")
+                        break
+                    
+                    # Priority 2: Primary Gene Name
+                    primary = gene.get("geneName")
+                    if primary:
+                        target_value = primary.get("value")
+                        break
+
+                if target_value:
+                    locus_mappings[match_key] = target_value
+
+        except Exception as e:
+            print(f"    Error in metadata chunk {i}: {e}")
+            continue
 
     if VERBOSE:
         print(f"    Successfully found alternative identifiers for {len(locus_mappings)} entries.")
-
-    print(locus_mappings)
 
     return locus_mappings
 
@@ -388,6 +390,7 @@ def parse_gff_neighborhood(gff_path):
 def calculate_distances(input_csv, output_csv, genes, gff_index, uniprot_to_gene):
     """
     Calculate distances for ALL pairs. Unmapped pairs will have NaN/None values.
+    Includes genomic start and end coordinates for both proteins.
     """
     results = []
 
@@ -402,15 +405,18 @@ def calculate_distances(input_csv, output_csv, genes, gff_index, uniprot_to_gene
             id_val2 = uniprot_to_gene.get(u2)
 
             # Initialize all values as NaN or None
-            # same_contig and same_strand are now NaN by default instead of False
             res = {
                 "uniprot_id1": u1, 
                 "mapped_id1": id_val1,
                 "uniprot_id2": u2, 
                 "mapped_id2": id_val2,
                 "contig1": None, 
+                "start1": float("nan"),
+                "end1": float("nan"),
                 "strand1": None,
                 "contig2": None, 
+                "start2": float("nan"),
+                "end2": float("nan"),
                 "strand2": None,
                 "same_contig": float("nan"), 
                 "same_strand": float("nan"),
@@ -431,8 +437,14 @@ def calculate_distances(input_csv, output_csv, genes, gff_index, uniprot_to_gene
                 same_strand = g1["strand"] == g2["strand"]
 
                 res.update({
-                    "contig1": g1["seqid"], "strand1": g1["strand"],
-                    "contig2": g2["seqid"], "strand2": g2["strand"],
+                    "contig1": g1["seqid"], 
+                    "start1": g1["start"],
+                    "end1": g1["end"],
+                    "strand1": g1["strand"],
+                    "contig2": g2["seqid"], 
+                    "start2": g2["start"],
+                    "end2": g2["end"],
+                    "strand2": g2["strand"],
                     "same_contig": same_contig,
                     "same_strand": same_strand,
                     "status": "success" if same_contig else "different_contigs"
@@ -463,8 +475,8 @@ def calculate_distances(input_csv, output_csv, genes, gff_index, uniprot_to_gene
 
     if results:
         fieldnames = [
-            "uniprot_id1", "mapped_id1", "uniprot_id2", "mapped_id2",
-            "contig1", "strand1", "contig2", "strand2",
+            "uniprot_id1", "mapped_id1", "contig1", "start1", "end1", "strand1",
+            "uniprot_id2", "mapped_id2", "contig2", "start2", "end2", "strand2",
             "same_contig", "same_strand", "gene_dist_all",
             "gene_dist_same_strand", "base_gap", "status"
         ]
