@@ -3,21 +3,36 @@ Genomic Distance Calculator for UniProt Protein Pairs
 =====================================================
 
 Author: Gesa Freimann
-Date: 2026-02-02
+Date: 2026-02-04
+Version: 2.0
 
 Description
 -----------
-This script computes genomic proximity metrics between pairs of proteins
-identified by UniProt accessions. The workflow is:
+This script computes genomic proximity metrics between pairs of 
+proteins identified by UniProt accessions or Entry Names. It is designed 
+specifically for prokaryotic comparative genomics and operon analysis.
 
-1. Download a RefSeq genome annotation (GFF) from NCBI
-2. Parse gene coordinates and identifiers from the GFF
-3. Map UniProt accessions to NCBI GeneIDs via UniProt REST API
-4. For each UniProt pair, compute:
-   - Intergenic base-pair gap
-   - Number of intervening genes (any strand)
-   - Number of intervening genes on the same strand
-5. Output results to a CSV file
+Workflow:
+1. NCBI Data Acquisition: Downloads the RefSeq genomic annotation (GFF) for 
+    a specified genome assembly.
+2. GFF Indexing: Parses gene coordinates and builds a positional 
+    index using multiple identifiers (NCBI GeneID, Locus Tag, Old Locus Tag, 
+    and Gene Name) to maximize cross-database compatibility.
+3. ID Mapping: Maps UniProt queries to genomic identifiers using a 
+    two-step strategy:
+   - Primary: Bulk mapping of UniProt IDs to NCBI GeneIDs via REST API.
+   - Fallback: Direct UniProt metadata search for Ordered Locus Names (OLN) 
+     or Primary Gene Names for any IDs that failed standard mapping.
+4. Proximity Metrics Calculation: For each protein pair, the script computes:
+   - Intergenic Base-pair Gap: Precise physical distance between gene boundaries.
+   - Intervening Gene Count: Total number of genes located between the pair.
+   - Strand-Specific Distance: Count of genes on the same strand (useful for 
+     detecting potential operon co-membership).
+5. Reporting: Generates a CSV file containing all genomic 
+    coordinates and distances. Critically, every input pair is preserved in 
+    the output; pairs that could not be mapped are assigned 'NaN' values 
+    and a specific failure status for downstream filtering.
+
 
 """
 
@@ -51,6 +66,7 @@ import os
 import shutil
 import zipfile
 import csv
+import re
 
 
 # ============================================================================
@@ -150,45 +166,152 @@ def load_protein_pairs(input_file):
 # ============================ UNIPROT MAPPING ================================
 # ============================================================================
 
-def map_uniprot_to_ncbi(uniprot_ids):
+def chunk_list(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+import re
+
+def fetch_locus_tags(unmapped_ids):
     """
-    Map UniProt accessions to NCBI GeneIDs using UniProt ID Mapping API.
-
-    Parameters
-    ----------
-    uniprot_ids : list of str
-        UniProt accessions
-
-    Returns
-    -------
-    dict
-        Mapping: UniProt_ID -> GeneID
+    Fallback: Fetch Ordered Locus Names or Gene Names from UniProt.
+    Supports both UniProt Accessions and Entry Names (IDs).
     """
-    print(f"Mapping {len(uniprot_ids)} UniProt IDs to GeneID...")
+    locus_mappings = {}
+    if not unmapped_ids:
+        return locus_mappings
 
-    run_url = "https://rest.uniprot.org/idmapping/run"
-    params = {
-        "from": "UniProtKB_AC-ID",
-        "to": "GeneID",
-        "ids": ",".join(uniprot_ids)
-    }
+    print(f"  Attempting metadata lookup for {len(unmapped_ids)} unmapped IDs...")
+    
+    # 1. Build query: Check if ID looks like an Accession or an Entry Name (ID)
+    # Accessions: [OPQ][0-9][A-Z0-9]{3}[0-9] or [A-N,R-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}
+    # Entry Names: usually Word_Word (e.g., RECA_THETH)
+    query_parts = []
+    for uid in unmapped_ids:
+        if re.match(r"^[A-Z][0-9][A-Z0-9]{3}[0-9](-[0-9]+)?$", uid) or re.match(r"^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$", uid):
+            query_parts.append(f"accession:{uid}")
+        else:
+            query_parts.append(f"id:{uid}")
 
-    response = requests.post(run_url, data=params)
-    response.raise_for_status()
-    job_id = response.json()["jobId"]
+    query = " OR ".join(query_parts)
+    url = f"https://rest.uniprot.org/uniprotkb/search?query={query}&fields=id,accession,gene_oln,gene_primary&format=json"
 
-    status_url = f"https://rest.uniprot.org/idmapping/status/{job_id}"
-    while True:
-        status = requests.get(status_url).json()
-        if "results" in status or status.get("jobStatus") == "FINISHED":
-            break
-        time.sleep(2)
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
 
-    results_url = f"https://rest.uniprot.org/idmapping/results/{job_id}"
-    data = requests.get(results_url).json()
+        for entry in data.get("results", []):
+            acc = entry.get("primaryAccession")
+            entry_name = entry.get("uniProtkbId")
+            
+            # Determine which input ID matches this result
+            # (Mapping back to the original input used in the query)
+            match_key = None
+            if acc in unmapped_ids:
+                match_key = acc
+            elif entry_name in unmapped_ids:
+                match_key = entry_name
 
-    return {item["from"]: item["to"] for item in data.get("results", [])}
+            if not match_key:
+                continue
 
+            genes = entry.get("genes", [])
+            target_value = None
+
+            for gene in genes:
+                # Priority 1: Ordered Locus Name (OLN)
+                olns = gene.get("orderedLocusNames", [])
+                if olns:
+                    target_value = olns[0].get("value")
+                    break
+                
+                # Priority 2: Primary Gene Name
+                primary = gene.get("geneName")
+                if primary:
+                    target_value = primary.get("value")
+                    break
+
+            if target_value:
+                locus_mappings[match_key] = target_value
+
+    except Exception as e:
+        print(f"    Metadata lookup failed: {e}")
+
+    if VERBOSE:
+        print(f"    Successfully found alternative identifiers for {len(locus_mappings)} entries.")
+
+    print(locus_mappings)
+
+    return locus_mappings
+
+def map_uniprot_to_ncbi(uniprot_ids, chunk_size=25):
+    """
+    Map UniProt accessions to NCBI GeneIDs, with fallback to Locus Tags.
+    """
+    all_mappings = {}
+    
+    uniprot_list = list(uniprot_ids)
+    total_chunks = (len(uniprot_list) + chunk_size - 1) // chunk_size
+
+    print(f"Mapping {len(uniprot_list)} IDs in {total_chunks} chunks...")
+
+    for i, chunk in enumerate(chunk_list(uniprot_list, chunk_size), 1):
+        print(f"  Processing chunk {i}/{total_chunks} ({len(chunk)} IDs)...")
+        
+        run_url = "https://rest.uniprot.org/idmapping/run"
+        params = {
+            "from": "UniProtKB_AC-ID",
+            "to": "GeneID",
+            "ids": ",".join(chunk)
+        }
+
+        try:
+            # Submit Job
+            response = requests.post(run_url, data=params, timeout=30)
+            response.raise_for_status()
+            job_id = response.json().get("jobId")
+
+            # Poll Status
+            status_url = f"https://rest.uniprot.org/idmapping/status/{job_id}"
+            while True:
+                status_resp = requests.get(status_url, timeout=30)
+                status_resp.raise_for_status()
+                status = status_resp.json()
+                
+                if status.get("jobStatus") == "FINISHED" or "results" in status:
+                    break
+                if status.get("jobStatus") == "FAILED":
+                    print(f"    Warning: Chunk {i} failed.")
+                    break
+                time.sleep(2)
+
+            # Get Results
+            results_url = f"https://rest.uniprot.org/idmapping/results/{job_id}"
+            results_resp = requests.get(results_url, timeout=30)
+            results_resp.raise_for_status()
+            
+            chunk_results = results_resp.json().get("results", [])
+            for item in chunk_results:
+                all_mappings[item["from"]] = item["to"]
+
+        except Exception as e:
+            print(f"    Error processing chunk {i}: {e}")
+            continue # Move to next chunk even if one fails
+
+    unmapped = set(uniprot_ids) - set(all_mappings.keys())
+    
+    if unmapped:
+        locus_tags = fetch_locus_tags(list(unmapped))
+        all_mappings.update(locus_tags) # Add locus tags to the main mapping dict
+
+    # Final reporting
+    still_unmapped = set(uniprot_ids) - set(all_mappings.keys())
+    if still_unmapped:
+        print(f"WARNING: {len(still_unmapped)} IDs total did not map to GeneID or Locus Tag.")
+
+    return all_mappings
 
 # ============================================================================
 # ============================= GFF PARSING ==================================
@@ -231,15 +354,26 @@ def parse_gff_neighborhood(gff_path):
                 "end": int(parts[4]),
                 "strand": parts[6],
                 "locus_tag": attributes.get("locus_tag", ""),
+                "old_locus_tag": attributes.get("old_locus_tag", ""),
+                "gene_name": attributes.get("gene", ""),
                 "dbxref": attributes.get("Dbxref", "")
             })
 
     genes.sort(key=lambda x: (x["seqid"], x["start"]))
 
+    # Build the multi-key index
     index = {}
     for i, g in enumerate(genes):
+        # Index by locus_tag
         if g["locus_tag"]:
             index[g["locus_tag"]] = i
+        # Index by old locus_tag
+        if g["old_locus_tag"]:
+            index[g["old_locus_tag"]] = i
+        # Index by Gene Name (e.g., 'recA')
+        if g["gene_name"]:
+            index[g["gene_name"]] = i
+        # Index by NCBI GeneID
         for ref in g["dbxref"].split(","):
             if ref.startswith("GeneID:"):
                 index[ref.split(":")[1]] = i
@@ -253,14 +387,7 @@ def parse_gff_neighborhood(gff_path):
 
 def calculate_distances(input_csv, output_csv, genes, gff_index, uniprot_to_gene):
     """
-    Calculate genomic distance metrics for UniProt protein pairs.
-
-    Metrics include:
-    - Intergenic base-pair gap
-    - Number of intervening genes (any strand)
-    - Number of intervening genes on same strand
-
-    Cross-contig comparisons return NaN distances.
+    Calculate distances for ALL pairs. Unmapped pairs will have NaN/None values.
     """
     results = []
 
@@ -271,78 +398,81 @@ def calculate_distances(input_csv, output_csv, genes, gff_index, uniprot_to_gene
                 continue
 
             u1, u2 = row[0].strip(), row[1].strip()
-            gid1 = uniprot_to_gene.get(u1)
-            gid2 = uniprot_to_gene.get(u2)
+            id_val1 = uniprot_to_gene.get(u1)
+            id_val2 = uniprot_to_gene.get(u2)
 
-            if gid1 not in gff_index or gid2 not in gff_index:
-                print(f"Warning: mapping failed for {u1} or {u2}")
-                continue
+            # Initialize all values as NaN or None
+            # same_contig and same_strand are now NaN by default instead of False
+            res = {
+                "uniprot_id1": u1, 
+                "mapped_id1": id_val1,
+                "uniprot_id2": u2, 
+                "mapped_id2": id_val2,
+                "contig1": None, 
+                "strand1": None,
+                "contig2": None, 
+                "strand2": None,
+                "same_contig": float("nan"), 
+                "same_strand": float("nan"),
+                "gene_dist_all": float("nan"),
+                "gene_dist_same_strand": float("nan"),
+                "base_gap": float("nan"),
+                "status": "fail"
+            }
 
-            idx1, idx2 = gff_index[gid1], gff_index[gid2]
-            g1, g2 = genes[idx1], genes[idx2]
+            # Attempt to find indices in GFF
+            idx1 = gff_index.get(str(id_val1)) if id_val1 else None
+            idx2 = gff_index.get(str(id_val2)) if id_val2 else None
 
-            same_contig = g1["seqid"] == g2["seqid"]
-            same_strand = g1["strand"] == g2["strand"]
-
-            gene_dist_all = float("nan")
-            gene_dist_same_strand = float("nan")
-            base_gap = float("nan")
-
-            if same_contig:
-                # Physical distance: Intergenic gap (bases between features)
-                if idx1 < idx2:
-                    base_gap = max(0, g2['start'] - g1['end'] - 1)
-                else:
-                    base_gap = max(0, g1['start'] - g2['end'] - 1)
+            if idx1 is not None and idx2 is not None:
+                g1, g2 = genes[idx1], genes[idx2]
                 
-                # Neighborhood distance: count of any genes between the pair
-                gene_dist_all = abs(idx1 - idx2) - 1
-                
-                # Functional distance: count of genes on the same strand (operon check)
-                if same_strand:
-                    start_idx, end_idx = min(idx1, idx2), max(idx1, idx2)
-                    intervening = genes[start_idx + 1 : end_idx]
-                    gene_dist_same_strand = sum(1 for gx in intervening if gx['strand'] == g1['strand'])
+                same_contig = g1["seqid"] == g2["seqid"]
+                same_strand = g1["strand"] == g2["strand"]
 
-            results.append({
-                # Protein / gene identifiers
-                "uniprot_id1": u1,
-                "gene_id1": gid1,
-                "uniprot_id2": u2,
-                "gene_id2": gid2,
+                res.update({
+                    "contig1": g1["seqid"], "strand1": g1["strand"],
+                    "contig2": g2["seqid"], "strand2": g2["strand"],
+                    "same_contig": same_contig,
+                    "same_strand": same_strand,
+                    "status": "success" if same_contig else "different_contigs"
+                })
 
-                # Gene 1 coordinates
-                "contig1": g1["seqid"],
-                "start1": g1["start"],
-                "end1": g1["end"],
-                "size1": g1["end"] - g1["start"] + 1,
-                "strand1": g1["strand"],
+                if same_contig:
+                    # Physical base-pair gap
+                    if idx1 < idx2:
+                        res["base_gap"] = max(0, g2['start'] - g1['end'] - 1)
+                    else:
+                        res["base_gap"] = max(0, g1['start'] - g2['end'] - 1)
+                    
+                    # Intervening gene count
+                    res["gene_dist_all"] = abs(idx1 - idx2) - 1
+                    
+                    # Intervening same-strand count
+                    if same_strand:
+                        start_idx, end_idx = min(idx1, idx2), max(idx1, idx2)
+                        intervening = genes[start_idx + 1 : end_idx]
+                        res["gene_dist_same_strand"] = sum(1 for gx in intervening if gx['strand'] == g1['strand'])
+            else:
+                if VERBOSE:
+                    reason = "Unmapped ID" if not id_val1 or not id_val2 else "Not in GFF"
+                    print(f"Row ({u1}, {u2}): Distances set to NaN ({reason})")
+                res["status"] = "mapping_failed"
 
-                # Gene 2 coordinates
-                "contig2": g2["seqid"],
-                "start2": g2["start"],
-                "end2": g2["end"],
-                "size2": g2["end"] - g2["start"] + 1,
-                "strand2": g2["strand"],
-
-                # Structural relationships
-                "same_contig": same_contig,
-                "same_strand": same_strand,
-
-                # Distance metrics
-                "gene_dist_all": gene_dist_all,
-                "gene_dist_same_strand": gene_dist_same_strand,
-                "base_gap": base_gap
-            })
-
+            results.append(res)
 
     if results:
+        fieldnames = [
+            "uniprot_id1", "mapped_id1", "uniprot_id2", "mapped_id2",
+            "contig1", "strand1", "contig2", "strand2",
+            "same_contig", "same_strand", "gene_dist_all",
+            "gene_dist_same_strand", "base_gap", "status"
+        ]
         with open(output_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(results)
-
-        print(f"Results saved to {output_csv}")
+        print(f"Processed {len(results)} pairs. Results saved to {output_csv}")
 
 
 # ============================================================================

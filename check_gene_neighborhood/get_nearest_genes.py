@@ -3,19 +3,34 @@ Gene Neighborhood Extraction and UniProt Mapping Pipeline
 =========================================================
 
 Author: Gesa Freimann
-Date: 2026-02-02
+Date: 2026-02-04
+Version: 2.0
 
 Description
 -----------
-This script:
-1. Downloads a RefSeq genome annotation (GFF) from NCBI
-2. Parses gene coordinates, products, GeneIDs, and RefSeq protein IDs
-3. Identifies genomic neighbors for a list of query UniProt IDs
-4. Maps neighboring genes to UniProt accessions using a tiered strategy:
-   - RefSeq protein → UniProtKB (bulk mapping)
-   - GeneID → UniProtKB (bulk mapping)
-   - RefSeq protein → UniProtKB (direct UniProt search fallback)
-5. Outputs a structured JSON file
+This pipeline performs high-resolution genomic context analysis by extracting 
+neighboring genes for specific protein queries and cross-referencing them 
+across NCBI RefSeq and UniProtKB databases.
+
+Workflow:
+1. NCBI Data Acquisition: Downloads the RefSeq genomic annotation (GFF) for 
+   the specified assembly.
+2. GFF Parsing: Constructs a positional index using multiple keys 
+   (NCBI GeneID, Locus Tag, Old Locus Tag, and Gene Name) to maximize 
+   mapping compatibility.
+3. Query Mapping: Uses a tiered strategy to locate query UniProt IDs 
+   on the genome:
+   - Primary: Bulk mapping of UniProt Accessions to NCBI GeneIDs.
+   - Fallback: Direct UniProt metadata search for Ordered Locus Names (OLN) 
+     or Primary Gene Names if standard mapping fails or is unindexed.
+4. Neighborhood Extraction: Identifies X upstream and downstream neighbors 
+   located on the same strand as the query gene.
+5. Neighbor Mapping: Maps discovered neighbors back to 
+   UniProtKB via RefSeq Protein IDs, GeneIDs, or direct cross-reference 
+   searches.
+6. Output: Generates a JSON file containing all metadata. 
+   Critically, the output maintains 1:1 parity with the input; queries 
+   that could not be mapped are included as empty entries for data integrity.
 
 """
 
@@ -53,6 +68,7 @@ import shutil
 import zipfile
 import csv
 import json
+import re
 from collections import defaultdict
 
 
@@ -112,6 +128,68 @@ def download_ncbi_gff(ref_seq_acc, output_dir, verbose=True):
 # ============================================================================
 # ============================ UNIPROT MAPPING ================================
 # ============================================================================
+
+def fetch_locus_tags_and_names(unmapped_ids):
+    """
+    Fallback: Fetch Ordered Locus Names or Gene Names from UniProt.
+    Used for IDs that failed bulk mapping.
+    """
+    metadata_map = {}
+    if not unmapped_ids:
+        return metadata_map
+
+    if VERBOSE:
+        print(f"  Attempting metadata lookup for {len(unmapped_ids)} unmapped IDs...")
+    
+    # Identify if input is Accession or Entry Name for the query
+    query_parts = []
+    for uid in unmapped_ids:
+        if re.match(r"^[A-Z][0-9][A-Z0-9]{3}[0-9](-[0-9]+)?$", uid) or \
+           re.match(r"^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$", uid):
+            query_parts.append(f"accession:{uid}")
+        else:
+            query_parts.append(f"id:{uid}")
+
+    query = " OR ".join(query_parts)
+    url = "https://rest.uniprot.org/uniprotkb/search"
+    params = {
+        "query": query,
+        "fields": "id,accession,gene_oln,gene_primary",
+        "format": "json"
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+
+        for entry in data.get("results", []):
+            acc = entry.get("primaryAccession")
+            entry_name = entry.get("uniProtkbId")
+            
+            # Map back to whichever input ID was used
+            match_key = acc if acc in unmapped_ids else entry_name
+            if not match_key: continue
+
+            target_value = None
+            for gene in entry.get("genes", []):
+                # Priority 1: Ordered Locus Name
+                olns = gene.get("orderedLocusNames", [])
+                if olns:
+                    target_value = olns[0].get("value")
+                    break
+                # Priority 2: Primary Gene Name
+                primary = gene.get("geneName")
+                if primary:
+                    target_value = primary.get("value")
+                    break
+            
+            if target_value:
+                metadata_map[match_key] = target_value
+    except Exception as e:
+        print(f"    Metadata fallback failed: {e}")
+
+    return metadata_map
 
 def uniprot_id_mapping(ids, from_db, to_db):
     """
@@ -202,38 +280,18 @@ def uniprot_search_by_refseq(refseq):
 
 def parse_gff_metadata(gff_path):
     """
-    Parse a RefSeq GFF file to extract gene-level metadata.
-
-    Extracted fields:
-    - GeneID
-    - locus_tag
-    - product description
-    - RefSeq protein accession
-
-    Returns
-    -------
-    genes : list of dict
-        Sorted list of gene records
-    index : dict
-        Mapping GeneID -> index in genes list
+    Enhanced GFF Parser: Indexes GeneID, locus_tag, and gene name.
     """
     genes = []
     cds_info = {}
 
     with open(gff_path) as f:
         for line in f:
-            if line.startswith("#") or not line.strip():
-                continue
-
+            if line.startswith("#") or not line.strip(): continue
             parts = line.rstrip().split("\t")
-            if len(parts) < 9:
-                continue
-
-            attr = dict(
-                item.split("=", 1)
-                for item in parts[8].split(";")
-                if "=" in item
-            )
+            if len(parts) < 9: continue
+            
+            attr = dict(item.split("=", 1) for item in parts[8].split(";") if "=" in item)
 
             if parts[2] == "gene":
                 gene_id = "N/A"
@@ -247,17 +305,16 @@ def parse_gff_metadata(gff_path):
                     "end": int(parts[4]),
                     "strand": parts[6],
                     "locus_tag": attr.get("locus_tag", "N/A"),
+                    "old_locus_tag": attr.get("old_locus_tag", "N/A"),
+                    "gene_name": attr.get("gene") or attr.get("Name", "N/A"),
                     "gene_id": gene_id,
                     "product": "N/A",
                     "protein_id": "N/A",
                 })
-
             elif parts[2] == "CDS" and "locus_tag" in attr:
                 cds_info.setdefault(attr["locus_tag"], {})
-                if "product" in attr:
-                    cds_info[attr["locus_tag"]]["product"] = attr["product"]
-                if "protein_id" in attr:
-                    cds_info[attr["locus_tag"]]["protein_id"] = attr["protein_id"]
+                if "product" in attr: cds_info[attr["locus_tag"]]["product"] = attr["product"]
+                if "protein_id" in attr: cds_info[attr["locus_tag"]]["protein_id"] = attr["protein_id"]
 
     for g in genes:
         info = cds_info.get(g["locus_tag"], {})
@@ -265,7 +322,14 @@ def parse_gff_metadata(gff_path):
         g["protein_id"] = info.get("protein_id", "N/A")
 
     genes.sort(key=lambda x: (x["seqid"], x["start"]))
-    index = {g["gene_id"]: i for i, g in enumerate(genes) if g["gene_id"] != "N/A"}
+    
+    # Robust Multi-Key Index
+    index = {}
+    for i, g in enumerate(genes):
+        if g["gene_id"] != "N/A": index[str(g["gene_id"])] = i
+        if g["locus_tag"] != "N/A": index[g["locus_tag"]] = i
+        if g["old_locus_tag"] != "N/A": index[g["old_locus_tag"]] = i
+        if g["gene_name"] != "N/A": index[g["gene_name"]] = i
 
     return genes, index
 
@@ -275,29 +339,62 @@ def parse_gff_metadata(gff_path):
 # ============================================================================
 
 def main():
+    # 1. Load input IDs
+    if not os.path.exists(INPUT_CSV):
+        print(f"Error: Input file {INPUT_CSV} not found.")
+        return
+
     with open(INPUT_CSV) as f:
         uids = [row[0].strip() for row in csv.reader(f) if row]
 
-    gff_file = download_ncbi_gff(REF_SEQ_ACC, OUTPUT_DIR, VERBOSE)
+    # Initialize EVERY input ID with an empty list to ensure they appear in JSON
+    final_output = {uid: [] for uid in uids}
+
+    # 2. Download and Parse GFF
+    try:
+        gff_file = download_ncbi_gff(REF_SEQ_ACC, OUTPUT_DIR, VERBOSE)
+    except Exception as e:
+        print(f"Failed to download GFF: {e}")
+        return
+        
     genes, gff_index = parse_gff_metadata(gff_file)
 
-    query_to_gene = uniprot_id_mapping(
-        uids, "UniProtKB_AC-ID", "GeneID"
-    )
+    # 3. Phase 1: Bulk Mapping (UniProt -> GeneID)
+    query_to_gene = uniprot_id_mapping(uids, "UniProtKB_AC-ID", "GeneID")
 
+    # 4. Phase 2: Metadata Fallback for IDs missing from GFF
+    missing_from_gff = []
+    for uid in uids:
+        mapped_gids = query_to_gene.get(uid, [])
+        # Check if mapping failed OR if none of the mapped GeneIDs are in our GFF index
+        if not mapped_gids or not any(str(gid) in gff_index for gid in mapped_gids):
+            missing_from_gff.append(uid)
+    
+    if missing_from_gff:
+        metadata_backups = fetch_locus_tags_and_names(missing_from_gff)
+        for uid, backup_val in metadata_backups.items():
+            # Add the backup identifier (OLN or Gene Name) to the searchable list
+            query_to_gene.setdefault(uid, []).append(backup_val)
+
+    # 5. Neighborhood Collection
     neighborhood = {}
     all_proteins = set()
     all_geneids = set()
 
     for uid in uids:
-        gene_id = next(iter(query_to_gene.get(uid, [])), None)
-        if gene_id not in gff_index:
+        # Get the first identifier that successfully hits the GFF index
+        gene_id = next((gid for gid in query_to_gene.get(uid, []) if str(gid) in gff_index), None)
+        
+        if not gene_id:
+            if VERBOSE:
+                print(f"Warning: No valid genomic location found for {uid}")
             continue
 
-        center = gff_index[gene_id]
+        center = gff_index[str(gene_id)]
         target = genes[center]
         neighbors = []
 
+        # Helper to collect neighbors based on strand and distance
         def collect(step):
             found = 0
             idx = center + step
@@ -305,6 +402,7 @@ def main():
                 g = genes[idx]
                 if g["seqid"] != target["seqid"]:
                     break
+                # Only collect neighbors on the same strand
                 if g["strand"] == target["strand"]:
                     found += 1
                     n = g.copy()
@@ -316,23 +414,20 @@ def main():
                         all_geneids.add(n["gene_id"])
                 idx += step
 
-        collect(-1)
-        collect(1)
+        collect(-1) # Upstream
+        collect(1)  # Downstream
         neighborhood[uid] = neighbors
 
-    protein_to_uniprot = uniprot_id_mapping(
-        all_proteins, "RefSeq_Protein", "UniProtKB"
-    )
-    gene_to_uniprot = uniprot_id_mapping(
-        all_geneids, "GeneID", "UniProtKB"
-    )
-
+    # 6. Map the Neighboring Genes back to UniProt
+    protein_to_uniprot = uniprot_id_mapping(list(all_proteins), "RefSeq_Protein", "UniProtKB")
+    gene_to_uniprot = uniprot_id_mapping(list(all_geneids), "GeneID", "UniProtKB")
     refseq_search_cache = {}
 
-    final = {}
+    # 7. Compile final data
     for uid, neighbors in neighborhood.items():
-        final[uid] = []
+        processed_neighbors = []
         for n in neighbors:
+            # Tiered mapping for the neighbor
             if n["protein_id"] in protein_to_uniprot:
                 n["uniprot_ids"] = protein_to_uniprot[n["protein_id"]]
                 n["uniprot_mapping_source"] = "RefSeq_Protein"
@@ -340,25 +435,29 @@ def main():
                 n["uniprot_ids"] = gene_to_uniprot[n["gene_id"]]
                 n["uniprot_mapping_source"] = "GeneID"
             elif n["protein_id"] != "N/A":
-                refseq_search_cache.setdefault(
-                    n["protein_id"],
-                    uniprot_search_by_refseq(n["protein_id"])
-                )
+                if n["protein_id"] not in refseq_search_cache:
+                    refseq_search_cache[n["protein_id"]] = uniprot_search_by_refseq(n["protein_id"])
                 n["uniprot_ids"] = refseq_search_cache[n["protein_id"]]
-                n["uniprot_mapping_source"] = (
-                    "UniProt_search_RefSeq"
-                    if n["uniprot_ids"] else "None"
-                )
+                n["uniprot_mapping_source"] = "UniProt_search_RefSeq" if n["uniprot_ids"] else "None"
             else:
                 n["uniprot_ids"] = []
                 n["uniprot_mapping_source"] = "None"
+            
+            processed_neighbors.append(n)
+        
+        final_output[uid] = processed_neighbors
 
-            final[uid].append(n)
-
+    # 8. Save results
     with open(OUTPUT_JSON, "w") as f:
-        json.dump(final, f, indent=4)
+        json.dump(final_output, f, indent=4)
 
-    print(f"Analysis complete. JSON saved to {OUTPUT_JSON}")
+    if VERBOSE:
+        success_count = sum(1 for v in final_output.values() if v)
+        print(f"Analysis complete. Found neighborhoods for {success_count}/{len(uids)} IDs.")
+        print(f"JSON saved to {OUTPUT_JSON}")
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
